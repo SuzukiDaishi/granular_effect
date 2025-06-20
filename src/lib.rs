@@ -5,21 +5,68 @@ use rand::{rng, Rng};
 use std::{num::NonZeroU32, sync::Arc};
 
 /*──────────────────── 0. Parameters ────────────────────*/
-// A hand-written, EMPTY Params implementation – no UI-visible parameters
-pub struct NoParams;
-unsafe impl Params for NoParams {
-    fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
-        Vec::new() // <- tells nih-plug we have zero parameters
+// ４つの FloatParam パラメータを持つ struct を定義する。
+// - density: グレイン生成確率 (0.0=生成なし, 1.0=毎ブロック必ず生成)
+// - min_ms: グレインの最小長 (ミリ秒単位)
+// - max_ms: グレインの最大長 (ミリ秒単位)
+// - mix: ウェット／ドライ比率 (0.0=ドライのみ, 1.0=100% ウェット)
+#[derive(Params)]
+pub struct GranularParams {
+    /// グレインを生成する確率 (0.0=生成なし, 1.0=毎ブロック必ず生成)
+    #[id = "density"]
+    pub density: FloatParam,
+
+    /// グレインの最小長 (ミリ秒単位)
+    #[id = "min_ms"]
+    pub min_ms: FloatParam,
+
+    /// グレインの最大長 (ミリ秒単位)
+    #[id = "max_ms"]
+    pub max_ms: FloatParam,
+
+    /// ウェット／ドライ比率 (0.0=ドライのみ, 1.0=100% ウェット)
+    #[id = "mix"]
+    pub mix: FloatParam,
+}
+
+impl Default for GranularParams {
+    fn default() -> Self {
+        Self {
+            density: FloatParam::new("Density", 0.2, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(0.01)),
+
+            min_ms: FloatParam::new(
+                "Min Length (ms)",
+                20.0,
+                FloatRange::Linear {
+                    min: 1.0,
+                    max: 1000.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(1.0)),
+
+            max_ms: FloatParam::new(
+                "Max Length (ms)",
+                500.0,
+                FloatRange::Linear {
+                    min: 1.0,
+                    max: 1000.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(1.0)),
+
+            mix: FloatParam::new("Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(0.01)),
+        }
     }
 }
 
 /*──────────────────── 1. Constants (match Python) ──────*/
-const RING_SEC: f32 = 5.0;
-const MAX_GRAINS: usize = 25;
-const TRIGGER_PROB: f32 = 0.2;
-const MIN_MS: f32 = 20.0;
-const MAX_MS: f32 = 500.0;
-const TUKEY_ALPHA: f32 = 0.2;
+const RING_SEC: f32 = 5.0; // リングバッファの長さ (秒)
+const MAX_GRAINS: usize = 25; // 同時に立ち上がるグレイン数上限
+                              // TRIGGER_PROB は「density」パラメータで置き換え
+                              // MIN_MS / MAX_MS は「min_ms」「max_ms」パラメータで置き換え
+const TUKEY_ALPHA: f32 = 0.2; // Tukey 窓の形状
 
 /*──────────────────── 2. Internal structs ──────────────*/
 struct Grain {
@@ -35,7 +82,7 @@ impl Grain {
 }
 
 struct Granular {
-    params: Arc<NoParams>,
+    params: Arc<GranularParams>,
     ring: Vec<f32>,
     wr: usize,
     grains: Vec<Grain>,
@@ -45,28 +92,35 @@ struct Granular {
 impl Default for Granular {
     fn default() -> Self {
         Self {
-            params: Arc::new(NoParams),
+            params: Arc::new(GranularParams::default()),
             ring: Vec::new(),
             wr: 0,
             grains: Vec::new(),
-            sr: 48_000.0,
+            sr: 0.0,
         }
     }
 }
 
 /*──────────────────── 3. Plugin implementation ────────*/
 impl Plugin for Granular {
-    const NAME: &'static str = "Granular (Tukey)";
+    const NAME: &'static str = "Granular";
     const VENDOR: &'static str = "Daishi Suzuki";
     const URL: &'static str = "https://example.com";
     const EMAIL: &'static str = "zukky.rikugame@gmail.com";
-    const VERSION: &'static str = "0.2.0";
+    const VERSION: &'static str = "0.3.0";
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
-        ..AudioIOLayout::const_default()
-    }];
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(1),
+            main_output_channels: NonZeroU32::new(1),
+            ..AudioIOLayout::const_default()
+        },
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        },
+    ];
 
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
     const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
@@ -103,11 +157,17 @@ impl Plugin for Granular {
     ) -> ProcessStatus {
         let mut rng = rng();
         let n_ch = buffer.channels() as usize;
-        let min_len = ((MIN_MS / 1_000.0) * self.sr) as usize;
-        let max_len = ((MAX_MS / 1_000.0) * self.sr) as usize;
+
+        // ── ① パラメータ値を取得 ──
+        let density = self.params.density.smoothed.next();
+        let min_len_ms = self.params.min_ms.smoothed.next().max(1.0);
+        let max_len_ms = self.params.max_ms.smoothed.next().max(min_len_ms);
+        let min_len = ((min_len_ms / 1_000.0) * self.sr) as usize;
+        let max_len = ((max_len_ms / 1_000.0) * self.sr) as usize;
+        let mix = self.params.mix.smoothed.next().clamp(0.0, 1.0);
 
         // ── ① グレイン生成判定 (ブロックごと) ──
-        if self.grains.len() < MAX_GRAINS && rng.random::<f32>() < TRIGGER_PROB {
+        if self.grains.len() < MAX_GRAINS && rng.random::<f32>() < density {
             if self.ring.len() >= max_len {
                 let len = rng.random_range(min_len..=max_len);
                 let start = rng.random_range(0..self.ring.len() - len);
@@ -126,12 +186,11 @@ impl Plugin for Granular {
 
         // ── ② フレーム単位ループ ──
         for mut frame in buffer.iter_samples() {
-            // a. 入力をモノラル化（全チャンネル平均）
+            // a. モノラル化してリングバッファへ書き込む
             let mut mono_input = 0.0;
             for ch in 0..n_ch {
                 mono_input += *frame.get_mut(ch).unwrap();
             }
-            mono_input /= n_ch as f32;
 
             // b. モノラル化したサンプルをリングバッファへ書き込み
             self.ring[self.wr] = mono_input;
@@ -146,9 +205,11 @@ impl Plugin for Granular {
                 }
             }
 
-            // d. 合成したモノラル・グラニュラー音をチャンネル別に加算
+            // d. ドライ成分とウェット成分を mix でミックス
             for ch in 0..n_ch {
-                *frame.get_mut(ch).unwrap() += mixes[ch];
+                let dry = *frame.get_mut(ch).unwrap();
+                let out = dry * (1.0 - mix) + mixes[ch] * mix;
+                *frame.get_mut(ch).unwrap() = out;
             }
 
             // e. グレイン再生位置を進める
@@ -187,13 +248,14 @@ fn apply_tukey(x: &mut [f32], alpha: f32) {
 /*──────────────────── 5. CLAP / VST3 export ───────────*/
 impl ClapPlugin for Granular {
     const CLAP_ID: &'static str = "com.zukky.granular";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Granular effect with Tukey window");
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Granular effect with Tukey window + parameters");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
 }
 impl Vst3Plugin for Granular {
-    const VST3_CLASS_ID: [u8; 16] = *b"GranTukeyRustPl\0"; // exactly 16 bytes (with trailing null)
+    const VST3_CLASS_ID: [u8; 16] = *b"Granular!!!!!!!!";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx];
 }
 
@@ -270,6 +332,23 @@ mod tests {
 
         let mut plugin = Granular::default();
         assert!(plugin.initialize(&layout, &cfg, &mut DummyInit));
+
+        plugin
+            .params
+            .density
+            .smoothed
+            .reset(plugin.params.density.value());
+        plugin
+            .params
+            .min_ms
+            .smoothed
+            .reset(plugin.params.min_ms.value());
+        plugin
+            .params
+            .max_ms
+            .smoothed
+            .reset(plugin.params.max_ms.value());
+        plugin.params.mix.smoothed.reset(plugin.params.mix.value());
         let expected = (RING_SEC * cfg.sample_rate) as usize;
         assert_eq!(plugin.ring.len(), expected);
     }
@@ -344,5 +423,113 @@ mod tests {
 
         assert_eq!(buffer.channels(), 4);
         assert_eq!(buffer.samples(), frames);
+    }
+
+    #[test]
+    fn grains_mix_to_correct_channels() {
+        let layout = Granular::AUDIO_IO_LAYOUTS[0];
+        let cfg = BufferConfig {
+            sample_rate: 48000.0,
+            min_buffer_size: None,
+            max_buffer_size: 64,
+            process_mode: ProcessMode::Realtime,
+        };
+
+        struct DummyInit;
+        impl InitContext<Granular> for DummyInit {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Clap
+            }
+            fn execute(&self, _task: ()) {}
+            fn set_latency_samples(&self, _samples: u32) {}
+            fn set_current_voice_capacity(&self, _capacity: u32) {}
+        }
+
+        struct DummyCtx {
+            transport: Transport,
+        }
+        impl DummyCtx {
+            fn new(sr: f32) -> Self {
+                let mut t: Transport = unsafe { std::mem::zeroed() };
+                t.sample_rate = sr;
+                Self { transport: t }
+            }
+        }
+        impl ProcessContext<Granular> for DummyCtx {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Clap
+            }
+            fn execute_background(&self, _task: ()) {}
+            fn execute_gui(&self, _task: ()) {}
+            fn transport(&self) -> &Transport {
+                &self.transport
+            }
+            fn next_event(&mut self) -> Option<PluginNoteEvent<Granular>> {
+                None
+            }
+            fn send_event(&mut self, _event: PluginNoteEvent<Granular>) {}
+            fn set_latency_samples(&self, _samples: u32) {}
+            fn set_current_voice_capacity(&self, _capacity: u32) {}
+        }
+
+        let mut plugin = Granular::default();
+        assert!(plugin.initialize(&layout, &cfg, &mut DummyInit));
+
+        plugin
+            .params
+            .density
+            .smoothed
+            .reset(plugin.params.density.value());
+        plugin
+            .params
+            .min_ms
+            .smoothed
+            .reset(plugin.params.min_ms.value());
+        plugin
+            .params
+            .max_ms
+            .smoothed
+            .reset(plugin.params.max_ms.value());
+        plugin.params.mix.smoothed.reset(plugin.params.mix.value());
+
+        plugin.grains.clear();
+        plugin.grains.push(Grain {
+            buf: vec![1.0],
+            pos: 0,
+            ch: 0,
+        });
+        plugin.grains.push(Grain {
+            buf: vec![0.5],
+            pos: 0,
+            ch: 1,
+        });
+        while plugin.grains.len() < MAX_GRAINS {
+            plugin.grains.push(Grain {
+                buf: Vec::new(),
+                pos: 0,
+                ch: 0,
+            });
+        }
+
+        let frames = 1;
+        let mut real = vec![vec![0.0f32; frames]; 2];
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(frames, |s| {
+                *s = real.iter_mut().map(|c| c.as_mut_slice()).collect();
+            });
+        }
+        let mut aux_inputs: [Buffer; 0] = [];
+        let mut aux_outputs: [Buffer; 0] = [];
+        let mut aux = AuxiliaryBuffers {
+            inputs: &mut aux_inputs,
+            outputs: &mut aux_outputs,
+        };
+        let mut ctx = DummyCtx::new(cfg.sample_rate);
+        plugin.process(&mut buffer, &mut aux, &mut ctx);
+
+        let out = buffer.as_slice();
+        assert!((out[0][0] - 1.0).abs() < 1e-6);
+        assert!((out[1][0] - 0.5).abs() < 1e-6);
     }
 }
